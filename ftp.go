@@ -8,10 +8,10 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var REGEX_PWD_PATH *regexp.Regexp = regexp.MustCompile(`\"(.*)\"`)
@@ -32,35 +32,84 @@ func (ftp *FTP) Close() {
 	ftp.conn.Close()
 }
 
-type WalkFunc func(path string, info os.FileMode, err error) error
+type WalkFunc func(item FtpItem) error
 type RetrFunc func(r io.Reader) error
 
-func parseLine(line string) (perm string, t string, filename string) {
-	for _, v := range strings.Split(line, ";") {
-		v2 := strings.Split(v, "=")
+type FtpItem struct {
+	IsDir      bool
+	Permission string
+	FileCode   int
+	Owner      string
+	Group      string
+	Size       int
+	Time       time.Time
+	Path       string
+	Name       string
+}
 
-		switch v2[0] {
-		case "perm":
-			perm = v2[1]
-		case "type":
-			t = v2[1]
-		default:
-			filename = v[1 : len(v)-2]
+func parseLine(line string) (item FtpItem) {
+	r, _ := regexp.Compile(
+		`^(?P<dir>[\-ld])` +
+		`(?P<permission>(?:[\-r][\-w][\-xs]){3})\s+` +
+		`(?P<filecode>\d+)\s+` +
+		`(?P<owner>\w+)\s+` +
+		`(?P<group>\w+)\s+` +
+		`(?P<size>\d+)\s+` +
+		`(?P<ts>` +
+			`(?:(?P<month>\w{3})\s+(?P<day>\d{2})\s+(?P<hour>\d{2}):(?P<minute>\d{2}))|` +
+			`(?:(?P<month>\w{3})\s+(?P<day>\d{2})\s+(?P<year>\d{4}))` +
+		`)\s+` +
+		`(?P<name>.+)$`)
+	matches := r.FindStringSubmatch(strings.TrimSpace(line))
+
+	if len(matches) > 0 {
+		result := make(map[string]string)
+		for i, name := range r.SubexpNames() {
+			if i != 0 && len(matches[i]) > 0 {
+				result[name] = matches[i]
+			}
+		}
+		if v, ok := result["dir"]; ok && v != "-" {
+			item.IsDir = true
+		}
+		if v, ok := result["permission"]; ok {
+			item.Permission = v
+		}
+		if v, ok := result["filecode"]; ok {
+			if i, err := strconv.Atoi(v); err == nil {
+				item.FileCode = i
+			}
+		}
+		if v, ok := result["owner"]; ok {
+			item.Owner = v
+		}
+		if v, ok := result["group"]; ok {
+			item.Group = v
+		}
+		if v, ok := result["size"]; ok {
+			if i, err := strconv.Atoi(v); err == nil {
+				item.Size = i
+			}
+		}
+		if v, ok := result["ts"]; ok {
+			var err error
+			item.Time, err = time.Parse("2006 Jan 02 15:04", strconv.Itoa(time.Now().Year()) + " " + v)
+			if err != nil {
+				item.Time, _  = time.Parse("Jan 02  2006", v)
+			}
+			if item.Time.After(time.Now()) {
+				item.Time, err = time.Parse("2006 Jan 02 15:04", strconv.Itoa(time.Now().Year() - 1) + " " + v)
+			}
+		}
+		if v, ok := result["name"]; ok {
+			item.Name = v
 		}
 	}
-
 	return
 }
 
 // walks recursively through path and call walkfunc for each file
-func (ftp *FTP) Walk(path string, walkFn WalkFunc) (err error) {
-	/*
-		if err = walkFn(path, os.ModeDir, nil); err != nil {
-			if err == filepath.SkipDir {
-				return nil
-			}
-		}
-	*/
+func (ftp *FTP) Walk(path string, walkFn WalkFunc, recursive bool) (err error) {
 	if ftp.debug {
 		log.Printf("Walking: '%s'\n", path)
 	}
@@ -72,19 +121,20 @@ func (ftp *FTP) Walk(path string, walkFn WalkFunc) (err error) {
 	}
 
 	for _, line := range lines {
-		_, t, subpath := parseLine(line)
+		item := parseLine(line)
+		item.Path = path
 
-		switch t {
-		case "dir":
-			if subpath == "." {
-			} else if subpath == ".." {
-			} else {
-				if err = ftp.Walk(path+subpath+"/", walkFn); err != nil {
+		if item.IsDir {
+			if err = walkFn(item); err != nil {
+				return
+			}
+			if recursive {
+				if err = ftp.Walk(item.Path + item.Name + "/", walkFn, recursive); err != nil {
 					return
 				}
 			}
-		case "file":
-			if err = walkFn(path+subpath, os.FileMode(0), nil); err != nil {
+		} else {
+			if err = walkFn(item); err != nil {
 				return
 			}
 		}
@@ -401,7 +451,7 @@ func (ftp *FTP) Stor(path string, r io.Reader) (err error) {
 }
 
 // retrieves file
-func (ftp *FTP) Retr(path string, retrFn RetrFunc) (s string, err error) {
+func (ftp *FTP) Retr(path string, retrFn RetrFunc) (err error) {
 	if err = ftp.Type("I"); err != nil {
 		return
 	}
@@ -608,7 +658,7 @@ func ConnectDbg(addr string) (*FTP, error) {
 
 	var line string
 
-	object := &FTP{conn: conn, addr: addr, reader: reader, writer: writer, debug: false}
+	object := &FTP{conn: conn, addr: addr, reader: reader, writer: writer, debug: true}
 	line, _ = object.receive()
 
 	log.Print(line)
